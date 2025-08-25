@@ -1,99 +1,83 @@
-/**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
- */
-import { Env, ChatMessage } from "./types";
-
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
-const MODEL_ID = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-
-// Default system prompt
-const SYSTEM_PROMPT =
-  "You are a helpful, friendly assistant. Provide concise and accurate responses.";
-
+// Cloudflare Worker: Know2Close chat (Assistants API v2)
 export default {
-  /**
-   * Main request handler for the Worker
-   */
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext,
-  ): Promise<Response> {
-    const url = new URL(request.url);
-
-    // Handle static assets (frontend)
-    if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-      return env.ASSETS.fetch(request);
+  async fetch(request, env) {
+    if (request.method !== 'POST') {
+      return new Response('Method Not Allowed', { status: 405 });
     }
 
-    // API Routes
-    if (url.pathname === "/api/chat") {
-      // Handle POST requests for chat
-      if (request.method === "POST") {
-        return handleChatRequest(request, env);
-      }
-
-      // Method not allowed for other request types
-      return new Response("Method not allowed", { status: 405 });
+    const { message, thread_id } = await request.json();
+    if (!message || typeof message !== 'string') {
+      return new Response(JSON.stringify({ error: 'message is required' }), {
+        status: 400, headers: { 'Content-Type': 'application/json' }
+      });
     }
 
-    // Handle 404 for unmatched routes
-    return new Response("Not found", { status: 404 });
-  },
-} satisfies ExportedHandler<Env>;
-
-/**
- * Handles chat API requests
- */
-async function handleChatRequest(
-  request: Request,
-  env: Env,
-): Promise<Response> {
-  try {
-    // Parse JSON request body
-    const { messages = [] } = (await request.json()) as {
-      messages: ChatMessage[];
+    const headers = {
+      'Authorization': `Bearer ${env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+      // Assistants v2 header (required)
+      'OpenAI-Beta': 'assistants=v2'
     };
 
-    // Add system prompt if not present
-    if (!messages.some((msg) => msg.role === "system")) {
-      messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+    // 1) Ensure thread
+    let tid = thread_id;
+    if (!tid) {
+      const tRes = await fetch('https://api.openai.com/v1/threads', {
+        method: 'POST', headers
+      });
+      if (!tRes.ok) return err(tRes);
+      const tData = await tRes.json();
+      tid = tData.id;
     }
 
-    const response = await env.AI.run(
-      MODEL_ID,
-      {
-        messages,
-        max_tokens: 1024,
-      },
-      {
-        returnRawResponse: true,
-        // Uncomment to use AI Gateway
-        // gateway: {
-        //   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-        //   skipCache: false,      // Set to true to bypass cache
-        //   cacheTtl: 3600,        // Cache time-to-live in seconds
-        // },
-      },
-    );
+    // 2) Add user message
+    const mRes = await fetch(`https://api.openai.com/v1/threads/${tid}/messages`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ role: 'user', content: message })
+    });
+    if (!mRes.ok) return err(mRes);
 
-    // Return streaming response
-    return response;
-  } catch (error) {
-    console.error("Error processing chat request:", error);
-    return new Response(
-      JSON.stringify({ error: "Failed to process request" }),
-      {
-        status: 500,
-        headers: { "content-type": "application/json" },
-      },
-    );
+    // 3) Create a run
+    const runRes = await fetch(`https://api.openai.com/v1/threads/${tid}/runs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ assistant_id: env.KNOW2CLOSE_ASSISTANT_ID })
+    });
+    if (!runRes.ok) return err(runRes);
+    const runData = await runRes.json();
+
+    // 4) Poll until completed (simple loop; you can stream if you like)
+    let status = runData.status;
+    let runId = runData.id;
+    const maxWaitMs = 20000, stepMs = 800;
+    let waited = 0;
+    while (status !== 'completed' && status !== 'failed' && waited < maxWaitMs) {
+      await delay(stepMs); waited += stepMs;
+      const chk = await fetch(`https://api.openai.com/v1/threads/${tid}/runs/${runId}`, { headers });
+      if (!chk.ok) return err(chk);
+      const info = await chk.json();
+      status = info.status;
+    }
+    if (status !== 'completed') {
+      return new Response(JSON.stringify({ error: `Run ${status}` }), {
+        status: 500, headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 5) Read the latest assistant message
+    const listRes = await fetch(`https://api.openai.com/v1/threads/${tid}/messages?limit=1&order=desc`, { headers });
+    if (!listRes.ok) return err(listRes);
+    const list = await listRes.json();
+    const last = list.data?.[0];
+    const text = last?.content?.[0]?.text?.value || '(No response text)';
+
+    return new Response(JSON.stringify({ thread_id: tid, reply: text }), {
+      status: 200, headers: { 'Content-Type': 'application/json' }
+    });
   }
 }
+
+function err(res) {
+  return new Response(res.body, { status: res.status, headers: { 'Content-Type': 'application/json' }});
+}
+function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
