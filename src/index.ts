@@ -1,6 +1,6 @@
-// Cloudflare Worker: Know2Close chat (Assistants API v2) with CORS + health + path routing
+// Cloudflare Worker: Know2Close chat (Assistants API v2) with CORS + health + dual paths
 const CORS = {
-  "Access-Control-Allow-Origin": "*",              // or your exact funnel domain
+  "Access-Control-Allow-Origin": "*",              // or set to your exact funnel domain
   "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
   "Access-Control-Allow-Headers": "Content-Type"
 };
@@ -8,14 +8,14 @@ const CORS = {
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
     const url = new URL(request.url);
-    const isApiPath = url.pathname === "/" || url.pathname === "/api/know2close";
+    const isAllowedPath = url.pathname === "/" || url.pathname === "/api/know2close";
 
-    // CORS preflight
+    // 1) CORS preflight
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // Browser health check
+    // 2) Health page for quick browser check
     if (request.method === "GET") {
       const html = `<!doctype html><meta charset="utf-8" />
         <title>Know2Close API</title>
@@ -26,12 +26,12 @@ export default {
       return new Response(html, { status: 200, headers: { "Content-Type": "text/html", ...CORS } });
     }
 
-    // Only accept POST on the allowed paths
-    if (request.method !== "POST" || !isApiPath) {
+    // 3) Only accept POST on allowed paths
+    if (request.method !== "POST" || !isAllowedPath) {
       return new Response("Method Not Allowed", { status: 405, headers: CORS });
     }
 
-    // ---- existing logic (with safer JSON parse) ----
+    // ---- main logic ----
     const { message, thread_id } = await request.json().catch(() => ({} as any));
     if (!message || typeof message !== "string") {
       return json({ error: "message is required" }, 400);
@@ -43,51 +43,41 @@ export default {
       "OpenAI-Beta": "assistants=v2"
     };
 
-    // 1) Ensure thread
+    // Ensure thread
     let tid = thread_id;
     if (!tid) {
       const tRes = await fetch("https://api.openai.com/v1/threads", { method: "POST", headers });
       if (!tRes.ok) return proxyErr(tRes);
-      const tData = await tRes.json();
-      tid = tData.id;
+      tid = (await tRes.json()).id;
     }
 
-    // 2) Add user message
+    // Add message
     const mRes = await fetch(`https://api.openai.com/v1/threads/${tid}/messages`, {
-      method: "POST", headers,
-      body: JSON.stringify({ role: "user", content: message })
+      method: "POST", headers, body: JSON.stringify({ role: "user", content: message })
     });
     if (!mRes.ok) return proxyErr(mRes);
 
-    // 3) Create a run
+    // Run assistant
     const runRes = await fetch(`https://api.openai.com/v1/threads/${tid}/runs`, {
-      method: "POST", headers,
-      body: JSON.stringify({ assistant_id: env.KNOW2CLOSE_ASSISTANT_ID })
+      method: "POST", headers, body: JSON.stringify({ assistant_id: env.KNOW2CLOSE_ASSISTANT_ID })
     });
     if (!runRes.ok) return proxyErr(runRes);
-    const runData = await runRes.json();
+    const run = await runRes.json();
 
-    // 4) Poll until completed
-    let status = runData.status;
-    const runId = runData.id;
-    const maxWaitMs = 20000, stepMs = 800;
-    let waited = 0;
-    while (status !== "completed" && status !== "failed" && waited < maxWaitMs) {
-      await delay(stepMs); waited += stepMs;
-      const chk = await fetch(`https://api.openai.com/v1/threads/${tid}/runs/${runId}`, { headers });
+    // Poll until completed
+    let status = run.status, waited = 0;
+    while (status !== "completed" && status !== "failed" && waited < 20000) {
+      await new Promise(r => setTimeout(r, 800)); waited += 800;
+      const chk = await fetch(`https://api.openai.com/v1/threads/${tid}/runs/${run.id}`, { headers });
       if (!chk.ok) return proxyErr(chk);
-      const info = await chk.json();
-      status = info.status;
+      status = (await chk.json()).status;
     }
-    if (status !== "completed") {
-      return json({ error: `Run ${status}` }, 500);
-    }
+    if (status !== "completed") return json({ error: `Run ${status}` }, 500);
 
-    // 5) Read the latest assistant message
-    const listRes = await fetch(`https://api.openai.com/v1/threads/${tid}/messages?limit=1&order=desc`, { headers });
-    if (!listRes.ok) return proxyErr(listRes);
-    const list = await listRes.json();
-    const last = list.data?.[0];
+    // Read last message
+    const list = await fetch(`https://api.openai.com/v1/threads/${tid}/messages?limit=1&order=desc`, { headers });
+    if (!list.ok) return proxyErr(list);
+    const last = (await list.json()).data?.[0];
     const text = last?.content?.[0]?.text?.value || "(No response text)";
 
     return json({ thread_id: tid, reply: text }, 200);
@@ -106,4 +96,3 @@ function proxyErr(res: Response) {
     headers: { "Content-Type": "application/json", ...CORS }
   });
 }
-function delay(ms: number) { return new Promise(r => setTimeout(r, ms)); }
